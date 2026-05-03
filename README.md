@@ -60,13 +60,16 @@ bash ../scripts/build-xp32.sh
 # 5. Download the model
 bash ../scripts/download-model.sh
 
-# 6. Build the GUI
-g++ -o NeuralXP.exe ../gui/ai-assistant.cpp \
+# 6. Compile icon resource
+windres -i ../gui/neuralxp.rc -o neuralxp_res.o -O coff
+
+# 7. Build the GUI (with icon)
+g++ -o NeuralXP.exe ../gui/ai-assistant.cpp neuralxp_res.o \
     -static -mwindows -lcomctl32 -lcomdlg32 \
     -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 \
     -march=pentium-m -mno-sse3 -O2 -s
 
-# 7. (Optional) Build the installer
+# 8. (Optional) Build the installer
 makensis ../installer/NeuralXP-installer.nsi
 ```
 

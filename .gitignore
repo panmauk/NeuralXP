@@ -7,6 +7,9 @@
 *.lib
 *.exp
 
+# Generated icon previews (kept .ico, drop PNGs)
+gui/icon_*.png
+
 # Model files (too big for git)
 *.gguf
 models/

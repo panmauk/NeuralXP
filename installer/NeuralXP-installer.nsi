@@ -3,7 +3,7 @@
 ; XP-compatible NSIS installer
 
 !define APP_NAME "NeuralXP"
-!define APP_VERSION "1.0.1"
+!define APP_VERSION "1.0.2"
 !define APP_PUBLISHER "Panmox"
 !define APP_URL "https://panmox.org"
 !define APP_EXE "NeuralXP.exe"
@@ -42,8 +42,8 @@ VIAddVersionKey "FileVersion" "${APP_VERSION}"
 
 ; --- Modern UI configuration ---
 !define MUI_ABORTWARNING
-!define MUI_ICON "${NSISDIR}\Contrib\Graphics\Icons\modern-install.ico"
-!define MUI_UNICON "${NSISDIR}\Contrib\Graphics\Icons\modern-uninstall.ico"
+!define MUI_ICON "neuralxp.ico"
+!define MUI_UNICON "neuralxp.ico"
 
 ; --- Pages ---
 !insertmacro MUI_PAGE_WELCOME
