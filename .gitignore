@@ -1,0 +1,39 @@
+# Build artifacts
+*.exe
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+
+# Model files (too big for git)
+*.gguf
+models/
+
+# llama.cpp clone (handled by build script)
+llama.cpp/
+
+# Build directories
+build/
+build-xp32/
+deploy/
+deploy-backup-*/
+
+# Installer output
+NeuralXP-Setup-*.exe
+
+# Tools downloaded by build
+tools/
+nsis-*/
+
+# Saved chats (user data)
+chats/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

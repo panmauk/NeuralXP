@@ -1,0 +1,31 @@
+--- DESCRIPTION ---
+This patch replaces Vista+ threading APIs (SRWLOCK, CONDITION_VARIABLE)
+with XP-compatible equivalents (CRITICAL_SECTION, Event objects).
+
+Apply this to: ggml/src/ggml-cpu/ggml-cpu.c
+
+Look for sections using SRWLOCK and CONDITION_VARIABLE and replace with:
+
+--- FIND (approximate) ---
+
+#ifdef _WIN32
+typedef SRWLOCK ggml_lock_t;
+#define ggml_lock_init(lock)    InitializeSRWLock(lock)
+#define ggml_lock_lock(lock)    AcquireSRWLockExclusive(lock)
+#define ggml_lock_unlock(lock)  ReleaseSRWLockExclusive(lock)
+#define ggml_lock_destroy(lock)
+
+--- REPLACE WITH ---
+
+#ifdef _WIN32
+typedef CRITICAL_SECTION ggml_lock_t;
+#define ggml_lock_init(lock)    InitializeCriticalSection(lock)
+#define ggml_lock_lock(lock)    EnterCriticalSection(lock)
+#define ggml_lock_unlock(lock)  LeaveCriticalSection(lock)
+#define ggml_lock_destroy(lock) DeleteCriticalSection(lock)
+
+--- NOTES ---
+The exact line numbers will vary by llama.cpp version.
+The automated patch script (patch-for-xp.sh) handles this automatically.
+If applying manually, search for "SRWLOCK" and "CONDITION_VARIABLE" in the
+ggml source files and replace all occurrences.
