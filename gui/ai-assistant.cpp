@@ -26,6 +26,9 @@
 #define IDM_HELP_TIPS       1007
 #define IDM_FILE_OPENCHAT   1008
 
+// Icon resource IDs
+#define IDI_NEURALXP     1
+
 // Control IDs
 #define ID_CHAT_HISTORY  101
 #define ID_INPUT_BOX     102
@@ -1302,11 +1305,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = NULL;
     wc.lpszClassName = "NeuralXPClass";
-    // Load icon from embedded resource (id=1)
-    wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(1));
-    wc.hIconSm = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(1), IMAGE_ICON,
-                                   GetSystemMetrics(SM_CXSMICON),
-                                   GetSystemMetrics(SM_CYSMICON), 0);
+    wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_NEURALXP));
+    wc.hIconSm = (HICON)LoadImage(hInstance, MAKEINTRESOURCE(IDI_NEURALXP), IMAGE_ICON,
+                                   0, 0, LR_DEFAULTSIZE);
     if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
     if (!wc.hIconSm) wc.hIconSm = LoadIcon(NULL, IDI_APPLICATION);
 
