@@ -28,6 +28,15 @@ int main(int argc, char ** argv) {
                 n_max_tokens = std::stoi(argv[++i]);
             } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
                 prompt = argv[++i];
+            } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+                // Read the prompt (UTF-8) from a file: avoids command-line quoting/codepage problems
+                FILE * pf = fopen(argv[++i], "rb");
+                if (!pf) return 1;
+                char rbuf[4096];
+                size_t got;
+                prompt.clear();
+                while ((got = fread(rbuf, 1, sizeof(rbuf), pf)) > 0) prompt.append(rbuf, got);
+                fclose(pf);
             } else if (strcmp(argv[i], "-ngl") == 0 && i + 1 < argc) {
                 ngl = std::stoi(argv[++i]);
             }
@@ -37,7 +46,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty() || prompt.empty()) {
-        fprintf(stderr, "Usage: %s -m model.gguf -p \"prompt\" [-c ctx] [-n max_tokens]\n", argv[0]);
+        fprintf(stderr, "Usage: %s -m model.gguf (-p \"prompt\" | -f prompt.txt) [-c ctx] [-n max_tokens]\n", argv[0]);
         return 1;
     }
 
@@ -59,7 +68,10 @@ int main(int argc, char ** argv) {
     ctx_params.n_batch = n_ctx;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
-    if (!ctx) return 1;
+    if (!ctx) {
+        llama_model_free(model);
+        return 1;
+    }
 
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
@@ -86,8 +98,17 @@ int main(int argc, char ** argv) {
 
     // Tokenize
     const int n_prompt_tokens = -llama_tokenize(vocab, full_prompt.c_str(), full_prompt.size(), NULL, 0, true, true);
+    if (n_prompt_tokens <= 0) return 1;
+    // The prompt (system prompt + question) must leave room for at least a few answer tokens,
+    // otherwise llama_decode fails and the GUI would just show an empty answer.
+    if (n_prompt_tokens + 8 > n_ctx) {
+        fprintf(stderr, "Your message is too long for NeuralXP's memory. Please ask a shorter question.\n");
+        return 2;
+    }
     std::vector<llama_token> prompt_tokens(n_prompt_tokens);
-    llama_tokenize(vocab, full_prompt.c_str(), full_prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true);
+    if (llama_tokenize(vocab, full_prompt.c_str(), full_prompt.size(), prompt_tokens.data(), prompt_tokens.size(), true, true) < 0) {
+        return 1;
+    }
 
     // Generate
     llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
@@ -97,14 +118,14 @@ int main(int argc, char ** argv) {
         int ctx_used = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
         if (ctx_used + batch.n_tokens > n_ctx) break;
 
-        if (llama_decode(ctx, batch) != 0) break;
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "Inference failed.\n");
+            break;
+        }
 
         llama_token new_token_id = llama_sampler_sample(smpl, ctx, -1);
 
         if (llama_vocab_is_eog(vocab, new_token_id)) break;
-
-        n_generated++;
-        if (n_max_tokens > 0 && n_generated >= n_max_tokens) break;
 
         char buf[256];
         int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
@@ -112,6 +133,10 @@ int main(int argc, char ** argv) {
 
         fwrite(buf, 1, n, stdout);
         fflush(stdout);
+
+        // Count after printing so exactly n_max_tokens tokens are emitted (the last one used to be dropped)
+        n_generated++;
+        if (n_max_tokens > 0 && n_generated >= n_max_tokens) break;
 
         batch = llama_batch_get_one(&new_token_id, 1);
     }

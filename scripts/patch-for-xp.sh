@@ -58,9 +58,24 @@ fi
 # --- 3. Fix Vista+ threading APIs -> XP-compatible ---
 echo "[3/4] Patching threading primitives for XP compatibility..."
 
-# Fix SRWLOCK -> CRITICAL_SECTION in ggml source files
-GGML_FILES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.h" | head -500)
 PATCHED=0
+
+# 3a. ggml-cpu threadpool: current llama.cpp uses SRWLOCK + CONDITION_VARIABLE +
+#     SleepConditionVariableSRW (all Vista+). The old generic sed below turned
+#     CONDITION_VARIABLE_LOCKMODE_SHARED into "HANDLE_LOCKMODE_SHARED" (compile error),
+#     left SleepConditionVariableSRW unpatched, and its CS-wait replacement waited while
+#     still holding the lock (deadlock). Replace the whole block with patches/ggml-xp-threading.h
+#     (CRITICAL_SECTION + an XP-safe condition variable).
+CPU_C="ggml/src/ggml-cpu/ggml-cpu.c"
+if [ -f "$CPU_C" ] && grep -q "typedef CONDITION_VARIABLE ggml_cond_t;" "$CPU_C"; then
+    echo "  Patching $CPU_C (threadpool sync -> XP-safe CRITICAL_SECTION + condition variable)..."
+    cp "$(dirname "$0")/../patches/ggml-xp-threading.h" ggml/src/ggml-cpu/
+    perl -0pi -e 's{typedef CONDITION_VARIABLE ggml_cond_t;.*?#define ggml_cond_broadcast\(c\) WakeAllConditionVariable\(c\)}{#include "ggml-xp-threading.h"}s' "$CPU_C"
+    PATCHED=$((PATCHED + 1))
+fi
+
+# 3b. Anything else: SRWLOCK -> CRITICAL_SECTION (generic fallback for other files / older trees)
+GGML_FILES=$(find . -path ./vendor -prune -o \( -name "*.c" -o -name "*.cpp" -o -name "*.h" \) ! -name ggml-xp-threading.h -print | head -500)
 
 for f in $GGML_FILES; do
     if grep -q "SRWLOCK\|InitializeSRWLock\|AcquireSRWLock\|ReleaseSRWLock" "$f" 2>/dev/null; then
@@ -79,9 +94,11 @@ done
 for f in $GGML_FILES; do
     if grep -q "CONDITION_VARIABLE\|InitializeConditionVariable\|SleepConditionVariable\|WakeConditionVariable\|WakeAllConditionVariable" "$f" 2>/dev/null; then
         echo "  Patching $f (CONDITION_VARIABLE -> Event)..."
-        sed -i 's/CONDITION_VARIABLE/HANDLE/g' "$f"
+        sed -i 's/\bCONDITION_VARIABLE\b/HANDLE/g' "$f"
         sed -i 's/InitializeConditionVariable(\([^)]*\))/(*(\1) = CreateEvent(NULL, TRUE, FALSE, NULL))/g' "$f"
-        sed -i 's/SleepConditionVariableCS(\([^,]*\),\([^,]*\),[^)]*)/WaitForSingleObject(*(\1), INFINITE); ResetEvent(*(\1))/g' "$f"
+        # Must release the lock while waiting (the old replacement kept holding it -> deadlock).
+        # Manual-reset event: a SetEvent between Leave and Wait is not lost.
+        sed -i 's/SleepConditionVariable\(CS\|SRW\)(\([^,]*\),\([^,]*\),[^)]*)/(LeaveCriticalSection(\3), WaitForSingleObject(*(\2), INFINITE), EnterCriticalSection(\3), ResetEvent(*(\2)), TRUE)/g' "$f"
         sed -i 's/WakeConditionVariable(\([^)]*\))/SetEvent(*(\1))/g' "$f"
         sed -i 's/WakeAllConditionVariable(\([^)]*\))/SetEvent(*(\1))/g' "$f"
         PATCHED=$((PATCHED + 1))

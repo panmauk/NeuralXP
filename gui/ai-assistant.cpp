@@ -90,16 +90,23 @@ static HBRUSH g_hBrushWhite = NULL;
 static HBRUSH g_hBrushHeader = NULL;
 static HMENU g_hMenu = NULL;
 
+// Context window passed to the inference helper. With 256 the long system prompt plus the
+// question filled most of the window, so answers were cut off before the 80-token limit.
+#define NXP_CONTEXT_SIZE 512
+
+#define WM_APP_FOCUSINPUT (WM_APP + 1)
+
 // State
-static BOOL g_bGenerating = FALSE;
+static volatile BOOL g_bGenerating = FALSE;
 static HANDLE g_hThread = NULL;
+static volatile HANDLE g_hChildProcess = NULL;  // running inference helper (killed on exit)
 static char g_szModelPath[MAX_PATH] = {0};
 static char g_szExeDir[MAX_PATH] = {0};
 static char g_szChatsDir[MAX_PATH] = {0};
 static int g_nMessageCount = 0;
 static char g_szCurrentChat[MAX_CHAT_NAME] = {0};  // current chat name (empty = unsaved)
 static char g_szChatContext[300] = {0};  // loaded context from previous session - small to fit in 256-token window
-static char g_szChatFullHistory[8192] = {0};  // full saved chat for display only
+static char *g_szChatFullHistory = NULL;  // full saved chat for display only (malloc'd)
 
 // ---- Chat file helpers ----
 
@@ -171,26 +178,29 @@ static void AutoSaveChat(void) {
     char filepath[MAX_PATH];
     GetChatFilePath(filepath, MAX_PATH, g_szCurrentChat);
 
-    FILE *f = fopen(filepath, "w");
+    // Binary mode: we write \r\n ourselves (text mode produced \r\r\n)
+    FILE *f = fopen(filepath, "wb");
     if (!f) { free(allText); return; }
 
     // Write chat name header
     fprintf(f, "[NeuralXP Chat: %s]\r\n", g_szCurrentChat);
 
     // Parse line by line, save important ones
+    BOOL keepingMessage = FALSE;  // inside a kept message: keep its continuation lines too
     char *line = strtok(allText, "\r\n");
     while (line) {
         // Keep "You:" and "NeuralXP:" lines that aren't filler
         if (strncmp(line, "You:  ", 6) == 0) {
-            const char *content = line + 6;
-            if (!IsFillerLine(content)) {
-                fprintf(f, "%s\r\n", line);
-            }
+            keepingMessage = !IsFillerLine(line + 6);
+            if (keepingMessage) fprintf(f, "%s\r\n", line);
         } else if (strncmp(line, "NeuralXP:  ", 11) == 0) {
-            const char *content = line + 11;
-            if (!IsFillerLine(content)) {
-                fprintf(f, "%s\r\n", line);
-            }
+            keepingMessage = !IsFillerLine(line + 11);
+            if (keepingMessage) fprintf(f, "%s\r\n", line);
+        } else if (strncmp(line, "____", 4) == 0 || strncmp(line, "NeuralXP - Chat: ", 17) == 0) {
+            keepingMessage = FALSE;  // separators / headers written by the app itself
+        } else if (keepingMessage) {
+            // Multi-line answers: these lines used to be dropped from the saved chat
+            fprintf(f, "%s\r\n", line);
         }
         line = strtok(NULL, "\r\n");
     }
@@ -200,67 +210,74 @@ static void AutoSaveChat(void) {
 }
 
 // Load chat context from file
-// - g_szChatFullHistory gets full text (for display)
+// - g_szChatFullHistory gets the full text (for display; it is what gets auto-saved later,
+//   so it must contain the WHOLE chat - the old code kept only the first 50 lines / 8 KB
+//   and newer messages were permanently lost on the next save)
 // - g_szChatContext gets a tiny summary of LAST few user messages only (for AI prompt)
 static void LoadChatContext(const char *chatName) {
     char filepath[MAX_PATH];
     GetChatFilePath(filepath, MAX_PATH, chatName);
 
     g_szChatContext[0] = '\0';
-    g_szChatFullHistory[0] = '\0';
+    free(g_szChatFullHistory);
+    g_szChatFullHistory = NULL;
 
-    FILE *f = fopen(filepath, "r");
+    FILE *f = fopen(filepath, "rb");
     if (!f) return;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *data = (fsize > 0) ? (char *)malloc(fsize + 1) : NULL;
+    if (!data) { fclose(f); return; }
+    long got = (long)fread(data, 1, fsize, f);
+    data[got] = '\0';
+    fclose(f);
 
-    // Buffer all lines first so we can pick last few
-    char lines[50][256];  // max 50 lines, 256 chars each
-    int lineCount = 0;
-
-    char line[512];
-    fgets(line, sizeof(line), f);  // skip header
-
+    // Output can only shrink (blank lines dropped, \n -> \r\n at most doubles)
+    g_szChatFullHistory = (char *)malloc(got * 2 + 3);
+    if (!g_szChatFullHistory) { free(data); return; }
     int fullLen = 0;
-    while (fgets(line, sizeof(line), f) && lineCount < 50) {
+
+    char *p = strchr(data, '\n');
+    p = p ? p + 1 : data + got;  // skip header line
+    const char *lastUser[2] = {NULL, NULL};  // newest, second newest
+    while (*p) {
+        char *line = p;
+        char *nl = strchr(line, '\n');
+        if (nl) { *nl = '\0'; p = nl + 1; } else { p = line + strlen(line); }
         int len = strlen(line);
         while (len > 0 && (line[len-1] == '\r' || line[len-1] == '\n')) line[--len] = '\0';
         if (len == 0) continue;
 
-        // Save to full history for display
-        if (fullLen + len + 3 < (int)sizeof(g_szChatFullHistory)) {
-            strcpy(g_szChatFullHistory + fullLen, line);
-            fullLen += len;
-            g_szChatFullHistory[fullLen++] = '\r';
-            g_szChatFullHistory[fullLen++] = '\n';
-            g_szChatFullHistory[fullLen] = '\0';
+        memcpy(g_szChatFullHistory + fullLen, line, len);
+        fullLen += len;
+        g_szChatFullHistory[fullLen++] = '\r';
+        g_szChatFullHistory[fullLen++] = '\n';
+
+        if (strncmp(line, "You:  ", 6) == 0) {
+            lastUser[1] = lastUser[0];
+            lastUser[0] = line + 6;
         }
-
-        // Save to lines array for context picking
-        strncpy(lines[lineCount], line, 255);
-        lines[lineCount][255] = '\0';
-        lineCount++;
     }
-    fclose(f);
+    g_szChatFullHistory[fullLen] = '\0';
 
-    // Build tiny context: only last 2 user messages, compact
+    // Build tiny context: only last 2 user messages (oldest first), compact
     int contextLen = 0;
-    int userCount = 0;
-    for (int i = lineCount - 1; i >= 0 && userCount < 2; i--) {
-        if (strncmp(lines[i], "You:  ", 6) == 0) {
-            const char *content = lines[i] + 6;
-            int clen = strlen(content);
-            if (clen > 80) clen = 80;  // truncate long messages
-            if (contextLen + clen + 4 < (int)sizeof(g_szChatContext)) {
-                if (contextLen > 0) {
-                    g_szChatContext[contextLen++] = ';';
-                    g_szChatContext[contextLen++] = ' ';
-                }
-                strncpy(g_szChatContext + contextLen, content, clen);
-                contextLen += clen;
-                g_szChatContext[contextLen] = '\0';
-                userCount++;
+    for (int i = 1; i >= 0; i--) {
+        if (!lastUser[i]) continue;
+        int clen = strlen(lastUser[i]);
+        if (clen > 80) clen = 80;  // truncate long messages
+        if (contextLen + clen + 4 < (int)sizeof(g_szChatContext)) {
+            if (contextLen > 0) {
+                g_szChatContext[contextLen++] = ';';
+                g_szChatContext[contextLen++] = ' ';
             }
+            memcpy(g_szChatContext + contextLen, lastUser[i], clen);
+            contextLen += clen;
+            g_szChatContext[contextLen] = '\0';
         }
     }
+    free(data);
 }
 
 // Update window title with chat name
@@ -288,12 +305,14 @@ static int ListChats(char chatNames[][MAX_CHAT_NAME], int maxChats) {
     int count = 0;
     do {
         if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-            // Remove .txt extension for display
-            char name[MAX_CHAT_NAME];
-            strncpy(name, fd.cFileName, MAX_CHAT_NAME - 1);
-            name[MAX_CHAT_NAME - 1] = '\0';
+            // Remove .txt extension for display (strip before truncating, otherwise a long
+            // name lost its ".txt" and the dialog showed/opened the wrong name)
+            char name[MAX_PATH];
+            strncpy(name, fd.cFileName, MAX_PATH - 1);
+            name[MAX_PATH - 1] = '\0';
             char *dot = strrchr(name, '.');
             if (dot) *dot = '\0';
+            if (strlen(name) >= MAX_CHAT_NAME) continue;  // not a chat this app could have created
             strncpy(chatNames[count], name, MAX_CHAT_NAME);
             count++;
             if (count >= maxChats) break;
@@ -362,6 +381,12 @@ static BOOL CALLBACK OpenChatDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
                     char filepath[MAX_PATH];
                     GetChatFilePath(filepath, MAX_PATH, name);
                     DeleteFileA(filepath);
+                    // Deleting the open chat: forget it, or auto-save would recreate the file
+                    if (strcmp(name, g_szCurrentChat) == 0) {
+                        g_szCurrentChat[0] = '\0';
+                        g_szChatContext[0] = '\0';
+                        UpdateTitle();
+                    }
                     SendMessage(hList, LB_DELETESTRING, sel, 0);
                     if (SendMessage(hList, LB_GETCOUNT, 0, 0) == 0) {
                         SendMessageA(hList, LB_ADDSTRING, 0, (LPARAM)"(no saved chats)");
@@ -616,48 +641,99 @@ struct InferenceArgs {
     char prompt[2048];
 };
 
+// Convert a string from the ANSI codepage (what the A-controls give us) to UTF-8 (what the model expects).
+// Returns a malloc'd string or NULL.
+static char *AnsiToUtf8(const char *s) {
+    int wlen = MultiByteToWideChar(CP_ACP, 0, s, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    WCHAR *w = (WCHAR *)malloc(wlen * sizeof(WCHAR));
+    if (!w) return NULL;
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w, wlen);
+    int ulen = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    char *u = ulen > 0 ? (char *)malloc(ulen) : NULL;
+    if (u) WideCharToMultiByte(CP_UTF8, 0, w, -1, u, ulen, NULL, NULL);
+    free(w);
+    return u;
+}
+
+// Append model output (UTF-8 bytes) to the chat window.
+// Converts to the ANSI codepage and turns bare '\n' into "\r\n" (a multiline EDIT ignores bare LF).
+static void AppendModelOutput(const char *utf8, int len) {
+    if (len <= 0) return;
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, len, NULL, 0);
+    if (wlen <= 0) return;
+    WCHAR *w = (WCHAR *)malloc((wlen * 2 + 1) * sizeof(WCHAR));
+    WCHAR *w2 = (WCHAR *)malloc((wlen * 2 + 1) * sizeof(WCHAR));
+    if (!w || !w2) { free(w); free(w2); return; }
+    MultiByteToWideChar(CP_UTF8, 0, utf8, len, w, wlen);
+    int k = 0;
+    for (int i = 0; i < wlen; i++) {
+        if (w[i] == L'\r') continue;
+        if (w[i] == L'\n') w2[k++] = L'\r';
+        w2[k++] = w[i];
+    }
+    w2[k] = 0;
+    int alen = WideCharToMultiByte(CP_ACP, 0, w2, -1, NULL, 0, NULL, NULL);
+    char *a = alen > 0 ? (char *)malloc(alen) : NULL;
+    if (a) {
+        WideCharToMultiByte(CP_ACP, 0, w2, -1, a, alen, NULL, NULL);
+        AppendChat(a);
+        free(a);
+    }
+    free(w);
+    free(w2);
+}
+
+// Length of the longest prefix of buf that does not end in the middle of a UTF-8 sequence
+static int Utf8CompleteLen(const char *buf, int len) {
+    int i = len - 1, back = 0;
+    while (i >= 0 && back < 4 && (((unsigned char)buf[i]) & 0xC0) == 0x80) { i--; back++; }
+    if (i < 0) return len;
+    unsigned char lead = (unsigned char)buf[i];
+    int need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
+    return (len - i >= need) ? len : i;
+}
+
+static void FinishInference(const char *status) {
+    SetStatus(status);
+    g_bGenerating = FALSE;
+    EnableWindow(g_hSendButton, TRUE);
+    EnableWindow(g_hInputBox, TRUE);
+    // SetFocus only works from the UI thread, so ask the window to do it
+    PostMessage(g_hWnd, WM_APP_FOCUSINPUT, 0, 0);
+}
+
 static DWORD WINAPI InferenceThread(LPVOID lpParam) {
     struct InferenceArgs *args = (struct InferenceArgs *)lpParam;
 
-    char cmdline[4096];
-    // Escape quotes in prompt
-    char escaped[2048] = {0};
-    int j = 0;
-    for (int i = 0; args->prompt[i] && j < 2040; i++) {
-        if (args->prompt[i] == '"') {
-            escaped[j++] = '\\';
-            escaped[j++] = '"';
-        } else {
-            escaped[j++] = args->prompt[i];
-        }
-    }
-    escaped[j] = '\0';
-
-    // If we have chat context, prepend it briefly (kept very short to fit in 256-token window)
+    // Build the prompt. If we have chat context, prepend it briefly (kept short to fit the context window)
+    static char fullPrompt[2048 + 400];
     if (g_szChatContext[0]) {
-        char fullPrompt[1024];
-        // Re-escape context too (could contain quotes)
-        char ctxEscaped[512] = {0};
-        int k = 0;
-        for (int i = 0; g_szChatContext[i] && k < 500; i++) {
-            if (g_szChatContext[i] == '"') {
-                ctxEscaped[k++] = '\\';
-                ctxEscaped[k++] = '"';
-            } else {
-                ctxEscaped[k++] = g_szChatContext[i];
-            }
-        }
-        ctxEscaped[k] = '\0';
-        snprintf(fullPrompt, sizeof(fullPrompt),
-            "(Earlier: %s) %s", ctxEscaped, escaped);
-        snprintf(cmdline, sizeof(cmdline),
-            "\"%s\\llama-simple-chat-headless.exe\" -m \"%s\" -c 256 -n 80 -p \"%s\"",
-            g_szExeDir, g_szModelPath, fullPrompt);
+        snprintf(fullPrompt, sizeof(fullPrompt), "(Earlier: %s) %s", g_szChatContext, args->prompt);
     } else {
-        snprintf(cmdline, sizeof(cmdline),
-            "\"%s\\llama-simple-chat-headless.exe\" -m \"%s\" -c 256 -n 80 -p \"%s\"",
-            g_szExeDir, g_szModelPath, escaped);
+        snprintf(fullPrompt, sizeof(fullPrompt), "%s", args->prompt);
     }
+    free(args);
+
+    // Pass the prompt through a UTF-8 temp file instead of the command line:
+    // no quote/backslash escaping problems and non-ASCII characters reach the model intact.
+    char tmpDir[MAX_PATH], promptFile[MAX_PATH];
+    if (!GetTempPathA(MAX_PATH, tmpDir) || !GetTempFileNameA(tmpDir, "nxp", 0, promptFile)) {
+        snprintf(promptFile, MAX_PATH, "%s\\nxp_prompt.txt", g_szExeDir);
+    }
+    char *utf8 = AnsiToUtf8(fullPrompt);
+    FILE *pf = fopen(promptFile, "wb");
+    if (pf) {
+        const char *src = utf8 ? utf8 : fullPrompt;
+        fwrite(src, 1, strlen(src), pf);
+        fclose(pf);
+    }
+    free(utf8);
+
+    char cmdline[4096];
+    snprintf(cmdline, sizeof(cmdline),
+        "\"%s\\llama-simple-chat-headless.exe\" -m \"%s\" -c %d -n 80 -f \"%s\"",
+        g_szExeDir, g_szModelPath, NXP_CONTEXT_SIZE, promptFile);
 
     SECURITY_ATTRIBUTES sa;
     sa.nLength = sizeof(sa);
@@ -681,55 +757,51 @@ static DWORD WINAPI InferenceThread(LPVOID lpParam) {
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, g_szExeDir, &si, &pi)) {
         AppendChatLine("");
-        AppendChat("NeuralXP: Sorry, I couldn't start the inference engine.");
+        AppendChat("NeuralXP:  Sorry, I couldn't start the inference engine.");
         MessageBeep(MB_ICONHAND);
-        SetStatus("Error - inference engine not found");
-        g_bGenerating = FALSE;
-        EnableWindow(g_hSendButton, TRUE);
-        EnableWindow(g_hInputBox, TRUE);
-        SetFocus(g_hInputBox);
-        free(args);
         CloseHandle(hReadPipe);
         CloseHandle(hWritePipe);
+        DeleteFileA(promptFile);
+        FinishInference("Error - inference engine not found");
         return 1;
     }
+    g_hChildProcess = pi.hProcess;
 
     CloseHandle(hWritePipe);
 
-    // Read output
-    char buf[2];
+    // Read output in chunks (the old 1-byte reads split UTF-8 characters)
+    char buf[512 + 4];
+    int pending = 0;   // bytes of an incomplete UTF-8 sequence carried over
     DWORD bytesRead;
     BOOL firstChar = TRUE;
 
     AppendChatLine("");
     AppendChat("NeuralXP:  ");
 
-    while (ReadFile(hReadPipe, buf, 1, &bytesRead, NULL) && bytesRead > 0) {
-        buf[1] = '\0';
-        if (firstChar && (buf[0] == ' ' || buf[0] == '\n' || buf[0] == '\r')) continue;
-        firstChar = FALSE;
-
-        int len = GetWindowTextLengthA(g_hChatHistory);
-        SendMessageA(g_hChatHistory, EM_SETSEL, (WPARAM)len, (LPARAM)len);
-        SendMessageA(g_hChatHistory, EM_REPLACESEL, FALSE, (LPARAM)buf);
-        SendMessageA(g_hChatHistory, EM_SCROLLCARET, 0, 0);
+    while (ReadFile(hReadPipe, buf + pending, 512, &bytesRead, NULL) && bytesRead > 0) {
+        int len = pending + (int)bytesRead;
+        int start = 0;
+        if (firstChar) {
+            while (start < len && (buf[start] == ' ' || buf[start] == '\n' || buf[start] == '\r')) start++;
+            if (start < len) firstChar = FALSE;
+        }
+        int complete = start + Utf8CompleteLen(buf + start, len - start);
+        AppendModelOutput(buf + start, complete - start);
+        pending = len - complete;
+        memmove(buf, buf + complete, pending);
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
+    g_hChildProcess = NULL;
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(hReadPipe);
+    DeleteFileA(promptFile);
 
     g_nMessageCount++;
     UpdateMessageCount();
 
-    SetStatus("Ready");
-    g_bGenerating = FALSE;
-    EnableWindow(g_hSendButton, TRUE);
-    EnableWindow(g_hInputBox, TRUE);
-    SetFocus(g_hInputBox);
-
-    free(args);
+    FinishInference("Ready");
     return 0;
 }
 
@@ -772,11 +844,24 @@ static void DoSend(void) {
     EnableWindow(g_hSendButton, FALSE);
 
     SetStatus("NeuralXP is thinking...");
-    struct InferenceArgs *args = (struct InferenceArgs *)malloc(sizeof(struct InferenceArgs));
+    struct InferenceArgs *args = (struct InferenceArgs *)calloc(1, sizeof(struct InferenceArgs));
+    if (!args) {
+        FinishInference("Error - out of memory");
+        return;
+    }
     strncpy(args->prompt, start, sizeof(args->prompt) - 1);
 
+    // Close the previous (finished) thread's handle; it used to leak one handle per message
+    if (g_hThread) {
+        CloseHandle(g_hThread);
+        g_hThread = NULL;
+    }
     DWORD threadId;
     g_hThread = CreateThread(NULL, 0, InferenceThread, args, 0, &threadId);
+    if (!g_hThread) {
+        free(args);
+        FinishInference("Error - could not start inference thread");
+    }
 }
 
 // New chat
@@ -792,7 +877,8 @@ static void DoNewChat(void) {
     // Reset state
     g_szCurrentChat[0] = '\0';
     g_szChatContext[0] = '\0';
-    g_szChatFullHistory[0] = '\0';
+    free(g_szChatFullHistory);
+    g_szChatFullHistory = NULL;
 
     SetWindowTextA(g_hChatHistory, "");
     g_nMessageCount = 0;
@@ -834,7 +920,7 @@ static void DoOpenChat(void) {
     AppendChat("\r\n____________________________________________________________\r\n");
 
     // Show the saved chat history
-    if (g_szChatFullHistory[0]) {
+    if (g_szChatFullHistory && g_szChatFullHistory[0]) {
         AppendChat(g_szChatFullHistory);
         AppendChat("____________________________________________________________");
     } else {
@@ -867,10 +953,14 @@ static void DoSaveChat(void) {
         char *buf = (char *)malloc(len + 1);
         GetWindowTextA(g_hChatHistory, buf, len + 1);
 
-        FILE *f = fopen(filename, "w");
+        // Binary mode: the text already contains \r\n (text mode turned it into \r\r\n)
+        FILE *f = buf ? fopen(filename, "wb") : NULL;
         if (f) {
+            // Was __DATE__ (the compile date), not the date the chat was saved
+            SYSTEMTIME st;
+            GetLocalTime(&st);
             fprintf(f, "NeuralXP Chat Log\r\n");
-            fprintf(f, "Saved: %s\r\n", __DATE__);
+            fprintf(f, "Saved: %04d-%02d-%02d %02d:%02d\r\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
             fprintf(f, "========================================\r\n\r\n");
             fprintf(f, "%s", buf);
             fclose(f);
@@ -1085,6 +1175,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         int tabstop = 16;
         SendMessage(g_hChatHistory, EM_SETTABSTOPS, 1, (LPARAM)&tabstop);
+        // Default EDIT limit is 30000 chars: long chats silently stopped showing new text
+        SendMessage(g_hChatHistory, EM_SETLIMITTEXT, 0, 0);
+        SendMessage(g_hInputBox, EM_SETLIMITTEXT, 2000, 0);
 
         AppendChat("Welcome to NeuralXP!\r\n");
         AppendChat("Offline AI for Windows XP  -  Built by Panmox (panmox.org)\r\n");
@@ -1228,9 +1321,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 return 0;
             }
         }
+        // Stop a running inference helper; it used to keep running (and eating CPU) after exit
+        if (g_hChildProcess) TerminateProcess(g_hChildProcess, 1);
+        if (g_hThread) WaitForSingleObject(g_hThread, 2000);
         // Auto-save on exit
         AutoSaveChat();
         DestroyWindow(hWnd);
+        return 0;
+
+    case WM_APP_FOCUSINPUT:
+        SetFocus(g_hInputBox);
         return 0;
 
     case WM_DESTROY:

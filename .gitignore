@@ -40,3 +40,6 @@ chats/
 *~
 .DS_Store
 Thumbs.db
+
+# Linux packages (built by linux/build-linux.sh)
+linux/dist/

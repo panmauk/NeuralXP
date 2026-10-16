@@ -5,7 +5,12 @@ set(CMAKE_SYSTEM_NAME Windows)
 set(CMAKE_SYSTEM_PROCESSOR i686)
 
 # MinGW-w64 i686 compilers - exact path on this machine
-set(MINGW_ROOT "$MINGW_ROOT")
+# Override with the MINGW_ROOT environment variable (build-xp32.sh exports it)
+if(DEFINED ENV{MINGW_ROOT})
+    set(MINGW_ROOT "$ENV{MINGW_ROOT}")
+else()
+    set(MINGW_ROOT "$MINGW_ROOT")
+endif()
 set(CMAKE_C_COMPILER "${MINGW_ROOT}/bin/gcc.exe")
 set(CMAKE_CXX_COMPILER "${MINGW_ROOT}/bin/g++.exe")
 set(CMAKE_RC_COMPILER "${MINGW_ROOT}/bin/windres.exe")

@@ -12,9 +12,32 @@ BUILD_DIR="$LLAMA_DIR/build-xp32"
 DEPLOY_DIR="$PROJECT_DIR/deploy"
 TOOLCHAIN="$PROJECT_DIR/cmake/xp32-toolchain.cmake"
 
-# MinGW path on this machine
+# MinGW path on this machine (override with MINGW_ROOT=/path/to/mingw32)
+MINGW_ROOT="${MINGW_ROOT:-$MINGW_ROOT}"
+export MINGW_ROOT
 MINGW_BIN="$MINGW_ROOT/bin"
 export PATH="$MINGW_BIN:$PATH"
+
+# Pentium M: SSE2 only (see README) - without these the binary dies with "illegal instruction"
+XP_CFLAGS="-march=pentium-m -mno-sse3"
+XP_CMAKE_FLAGS=(
+    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
+    -DCMAKE_BUILD_TYPE=Release
+    -DGGML_NATIVE=OFF
+    -DGGML_AVX=OFF
+    -DGGML_AVX2=OFF
+    -DGGML_FMA=OFF
+    -DGGML_F16C=OFF
+    -DGGML_SSE42=OFF
+    -DGGML_SSSE3=OFF
+    -DGGML_SSE3=OFF
+    -DGGML_SSE2=ON
+    -DGGML_BMI2=OFF
+    -DGGML_CPU_ALL_VARIANTS=OFF
+    -DCMAKE_C_FLAGS="$XP_CFLAGS"
+    -DCMAKE_CXX_FLAGS="$XP_CFLAGS"
+    -DBUILD_SHARED_LIBS=OFF
+)
 
 echo "============================================"
 echo "  llama.cpp -> Windows XP 32-bit Builder"
@@ -47,27 +70,24 @@ bash "$SCRIPT_DIR/patch-for-xp.sh"
 echo ""
 echo "[3/5] Configuring CMake..."
 cmake -B "$BUILD_DIR" \
-    -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
-    -DCMAKE_BUILD_TYPE=Release \
+    "${XP_CMAKE_FLAGS[@]}" \
     -DLLAMA_CURL=OFF \
     -DLLAMA_BUILD_SERVER=OFF \
     -DLLAMA_BUILD_EXAMPLES=ON \
-    -DGGML_NATIVE=OFF \
-    -DGGML_AVX=OFF \
-    -DGGML_AVX2=OFF \
-    -DGGML_FMA=OFF \
-    -DGGML_F16C=OFF \
-    -DGGML_SSE42=OFF \
-    -DGGML_SSSE3=OFF \
-    -DGGML_SSE3=OFF \
-    -DGGML_SSE2=ON \
-    -DBUILD_SHARED_LIBS=OFF \
     -G "MinGW Makefiles"
 
 # --- Step 5: Build ---
 echo ""
 echo "[4/5] Building..."
 cmake --build "$BUILD_DIR" --config Release -- -j$(nproc 2>/dev/null || echo 4)
+
+# The GUI runs llama-simple-chat-headless.exe, which the steps above never built
+echo "  Building NeuralXP inference helper..."
+cmake -S "$PROJECT_DIR/cmake/helper" -B "$BUILD_DIR-helper" \
+    -DLLAMA_DIR="$LLAMA_DIR" \
+    "${XP_CMAKE_FLAGS[@]}" \
+    -G "MinGW Makefiles"
+cmake --build "$BUILD_DIR-helper" --config Release -- -j$(nproc 2>/dev/null || echo 4)
 
 # --- Step 6: Package for deployment ---
 echo ""
@@ -78,6 +98,8 @@ mkdir -p "$DEPLOY_DIR"
 cp "$BUILD_DIR/bin/llama-cli.exe" "$DEPLOY_DIR/" 2>/dev/null || true
 cp "$BUILD_DIR/bin/llama-simple.exe" "$DEPLOY_DIR/" 2>/dev/null || true
 cp "$BUILD_DIR/bin/main.exe" "$DEPLOY_DIR/" 2>/dev/null || true
+cp "$BUILD_DIR-helper/llama-simple-chat-headless.exe" "$DEPLOY_DIR/" 2>/dev/null || \
+    cp "$BUILD_DIR-helper/bin/llama-simple-chat-headless.exe" "$DEPLOY_DIR/"
 
 # Copy MinGW runtime DLLs
 for dll in libgcc_s_dw2-1.dll libstdc++-6.dll libwinpthread-1.dll; do
