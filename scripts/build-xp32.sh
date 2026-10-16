@@ -12,8 +12,8 @@ BUILD_DIR="$LLAMA_DIR/build-xp32"
 DEPLOY_DIR="$PROJECT_DIR/deploy"
 TOOLCHAIN="$PROJECT_DIR/cmake/xp32-toolchain.cmake"
 
-# MinGW path on this machine (override with MINGW_ROOT=/path/to/mingw32)
-MINGW_ROOT="${MINGW_ROOT:-$MINGW_ROOT}"
+# Set MINGW_ROOT to the MinGW installation directory.
+: "${MINGW_ROOT:?Set MINGW_ROOT to the MinGW installation directory}"
 export MINGW_ROOT
 MINGW_BIN="$MINGW_ROOT/bin"
 export PATH="$MINGW_BIN:$PATH"
@@ -126,3 +126,4 @@ echo "  2. Copy the entire 'deploy' folder to a USB drive"
 echo "  3. Plug the USB into your Inspiron 6000"
 echo "  4. Run 'run-on-xp.bat' from the USB or copy to C:\\llama"
 echo ""
+
