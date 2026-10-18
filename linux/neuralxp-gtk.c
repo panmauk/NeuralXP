@@ -10,7 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define NXP_VERSION "1.0.1"
+#define NXP_VERSION "1.0.3"
 
 #define WIN_WIDTH   540
 #define WIN_HEIGHT  500
@@ -518,13 +518,26 @@ static void watch_fd(int fd, GIOFunc fn) {
 static void start_inference(const char *prompt) {
     char *full = g_chat_context[0] ? g_strdup_printf("(Earlier: %s) %s", g_chat_context, prompt)
                                    : g_strdup(prompt);
-    // Arguments go straight to argv: no shell, no quoting problems
+    // The prompt goes through a pipe on stdin, not argv: command lines are readable by every
+    // local user (ps, /proc/<pid>/cmdline). No shell is involved, so no quoting problems either.
     char *argv[] = { g_helper_path, "-m", g_model_path, "-c", NXP_CONTEXT_SIZE,
-                     "-n", NXP_MAX_TOKENS, "-p", full, NULL };
-    int out_fd, err_fd;
+                     "-n", NXP_MAX_TOKENS, "-f", "/dev/stdin", NULL };
+    int in_fd, out_fd, err_fd;
     GError *err = NULL;
     gboolean ok = g_spawn_async_with_pipes(g_exe_dir, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD,
-                                           NULL, NULL, &g_child_pid, NULL, &out_fd, &err_fd, &err);
+                                           NULL, NULL, &g_child_pid, &in_fd, &out_fd, &err_fd, &err);
+    if (ok) {
+        // A few KB at most (input is capped at 2000 chars), well below the pipe buffer: cannot block
+        const char *p = full;
+        size_t left = strlen(full);
+        while (left > 0) {
+            ssize_t w = write(in_fd, p, left);
+            if (w <= 0) break;
+            p += w;
+            left -= (size_t)w;
+        }
+        close(in_fd);
+    }
     g_free(full);
 
     append_chat_line("NeuralXP:  ");
@@ -733,8 +746,23 @@ typedef struct {
     gboolean done, ok, cancelled;
     guint timer;
     GMainLoop *loop;
+    GThread *verifier;      // SHA-256 check running in the background
+    gint verify_done;
     char error[256];
 } Download;
+
+static void dl_verify_finished(Download *dl);
+
+static gboolean dl_verify_tick(gpointer data) {
+    Download *dl = data;
+    if (!g_atomic_int_get(&dl->verify_done)) {
+        gtk_progress_bar_pulse(GTK_PROGRESS_BAR(dl->bar));
+        return TRUE;
+    }
+    dl->timer = 0;
+    dl_verify_finished(dl);
+    return FALSE;
+}
 
 static gpointer verify_thread(gpointer data) {
     Download *dl = data;
@@ -749,6 +777,7 @@ static gpointer verify_thread(gpointer data) {
         ok = strcmp(g_checksum_get_string(cs), MODEL_SHA256) == 0;
     }
     g_checksum_free(cs);
+    g_atomic_int_set(&dl->verify_done, 1);
     return GINT_TO_POINTER(ok);
 }
 
@@ -776,10 +805,18 @@ static void dl_exit(GPid pid, gint status, gpointer data) {
         return;
     }
     gtk_label_set_text(GTK_LABEL(dl->label), "Verifying download...");
-    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(dl->bar));
-    GThread *t = g_thread_new("verify", verify_thread, dl);
-    while (gtk_events_pending()) gtk_main_iteration();
-    dl->ok = GPOINTER_TO_INT(g_thread_join(t));
+    gtk_progress_bar_set_text(GTK_PROGRESS_BAR(dl->bar), NULL);
+    // Hash in a thread and keep the main loop running (pulsing the bar) until it is done;
+    // joining right away froze the window for the whole 415 MB hash on slow machines.
+    g_atomic_int_set(&dl->verify_done, 0);
+    dl->verifier = g_thread_new("verify", verify_thread, dl);
+    g_source_remove(dl->timer);
+    dl->timer = g_timeout_add(150, dl_verify_tick, dl);
+}
+
+static void dl_verify_finished(Download *dl) {
+    dl->ok = GPOINTER_TO_INT(g_thread_join(dl->verifier));
+    dl->verifier = NULL;
     if (dl->ok) {
         dl->ok = g_rename(dl->part_path, dl->final_path) == 0;
         if (!dl->ok) snprintf(dl->error, sizeof(dl->error), "Could not save the model file.");
@@ -793,6 +830,7 @@ static void dl_exit(GPid pid, gint status, gpointer data) {
 static void dl_response(GtkDialog *d, gint r, gpointer data) {
     (void)d; (void)r;
     Download *dl = data;
+    if (dl->verifier) return;  // verifying: let it finish (the thread uses dl)
     if (dl->pid) { dl->cancelled = TRUE; kill(dl->pid, SIGTERM); }
     else g_main_loop_quit(dl->loop);
 }
@@ -843,7 +881,7 @@ static gboolean download_model(void) {
         g_child_watch_add(dl.pid, dl_exit, &dl);
         dl.timer = g_timeout_add(300, dl_tick, &dl);
         g_main_loop_run(dl.loop);
-        g_source_remove(dl.timer);
+        if (dl.timer) g_source_remove(dl.timer);
         g_main_loop_unref(dl.loop);
     }
     gtk_widget_destroy(dl.dialog);
@@ -1153,6 +1191,9 @@ static void on_activate(GtkApplication *app, gpointer data) {
 }
 
 int main(int argc, char **argv) {
+    // Writing the prompt to a helper that already exited must fail with EPIPE, not kill the GUI
+    signal(SIGPIPE, SIG_IGN);
+
     // Directory of the real executable (works for /opt/neuralxp/bin and inside an AppImage)
     char *exe = g_file_read_link("/proc/self/exe", NULL);
     g_exe_dir = exe ? g_path_get_dirname(exe) : g_get_current_dir();

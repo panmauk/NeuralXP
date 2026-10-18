@@ -19,7 +19,7 @@ Built against Ubuntu 22.04 (glibc 2.35, GTK 3.24) so they run on Ubuntu 22.04+, 
 Linux Mint 21+, Fedora 36+ and similar. llama.cpp is built with one CPU backend per CPU generation
 (`GGML_CPU_ALL_VARIANTS`); the fastest one your CPU supports is picked at runtime.
 
-Install: `sudo apt install ./neuralxp_1.0.1_amd64.deb`, or `chmod +x NeuralXP-*.AppImage` and run it.
+Install: `sudo apt install ./neuralxp_1.0.3_amd64.deb`, or `chmod +x NeuralXP-*.AppImage` and run it.
 The AppImages use the system's GTK 3 (installed on practically every desktop).
 
 ## Where things live

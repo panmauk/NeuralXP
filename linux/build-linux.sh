@@ -34,7 +34,7 @@ APPIMAGETOOL="${APPIMAGETOOL:-$TOOLS/appimagetool-x86_64.AppImage}"
 RUNTIME_DIR="${RUNTIME_DIR:-$TOOLS}"
 WORK="${WORK:-$HOME/build/neuralxp}"
 DIST="$SCRIPT_DIR/dist"
-VERSION="1.0.1"
+VERSION="1.0.3"
 JOBS="$(nproc)"
 
 TARGET="${1:-all}"
@@ -103,12 +103,20 @@ set(CMAKE_STRIP $TC/$TRIPLET-strip CACHE FILEPATH \"\")" >> "$B/toolchain.cmake"
 
     # Ubuntu 22.04's GCC 12 does not know -march=armv9.2-a+sme (needs GCC 14). Drop the two SME
     # variants; SME CPUs (rare) then use the armv8.6 (SVE2 + i8mm) variant instead.
+    # The edit is undone after configuring, so the llama.cpp checkout is left untouched.
+    local GGML_CMAKE="$LLAMA_DIR/ggml/src/CMakeLists.txt" GGML_CMAKE_BAK=""
     if [ "$A" = arm64 ] && [ "$("$CXX" -dumpversion | cut -d. -f1)" -lt 14 ]; then
-        sed -i -E 's|^(\s*)(ggml_add_cpu_backend_variant\(armv9\.2_[12] .*)$|\1# \2  # NeuralXP: disabled, needs GCC 14|' \
-            "$LLAMA_DIR/ggml/src/CMakeLists.txt"
+        GGML_CMAKE_BAK="$B/ggml-src-CMakeLists.txt.orig"
+        cp -p "$GGML_CMAKE" "$GGML_CMAKE_BAK"
+        sed -i -E 's|^(\s*)(ggml_add_cpu_backend_variant\(armv9\.2_[12] .*)$|\1# \2  # NeuralXP: disabled, needs GCC 14|' "$GGML_CMAKE"
     fi
 
+    # Map absolute source/build paths to neutral names: __FILE__ (used by GGML_ASSERT messages)
+    # would otherwise put the build machine's home directory into the shipped binaries.
+    local PREFIX_MAP="-ffile-prefix-map=$LLAMA_DIR=llama.cpp -ffile-prefix-map=$PROJECT_DIR=neuralxp -ffile-prefix-map=$WORK=build -ffile-prefix-map=$SYSROOT="
+
     log "[$A] Building inference helper + llama.cpp"
+    local cmake_ok=0
     # GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS: one libggml-cpu-<variant>.so per CPU generation,
     # the best one is picked at runtime (fast on new CPUs, still runs on old ones).
     cmake -S "$PROJECT_DIR/cmake/helper" -B "$B/helper" -G "Unix Makefiles" \
@@ -123,17 +131,21 @@ set(CMAKE_STRIP $TC/$TRIPLET-strip CACHE FILEPATH \"\")" >> "$B/toolchain.cmake"
         -DCMAKE_SKIP_BUILD_RPATH=OFF \
         -DCMAKE_BUILD_RPATH_USE_ORIGIN=ON \
         -DCMAKE_BUILD_RPATH='$ORIGIN' \
+        -DCMAKE_C_FLAGS="$PREFIX_MAP" \
+        -DCMAKE_CXX_FLAGS="$PREFIX_MAP" \
         -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc -Wl,-rpath,\$ORIGIN" \
         -DCMAKE_SHARED_LINKER_FLAGS="-static-libstdc++ -static-libgcc -Wl,-rpath,\$ORIGIN" \
         -DCMAKE_MODULE_LINKER_FLAGS="-static-libstdc++ -static-libgcc -Wl,-rpath,\$ORIGIN" \
-        > "$B/cmake.log"
+        > "$B/cmake.log" || cmake_ok=1
+    if [ -n "$GGML_CMAKE_BAK" ]; then mv -f "$GGML_CMAKE_BAK" "$GGML_CMAKE"; fi
+    [ $cmake_ok = 0 ] || exit 1
     # "all": the helper, libllama/libggml and every libggml-cpu-<variant>.so
     cmake --build "$B/helper" -j"$JOBS" > "$B/build.log" 2>&1 || { tail -40 "$B/build.log"; exit 1; }
 
     log "[$A] Building GUI"
     local PKG_ENV="PKG_CONFIG_SYSROOT_DIR=$SYSROOT PKG_CONFIG_LIBDIR=$SYSROOT/usr/lib/$TRIPLET/pkgconfig:$SYSROOT/usr/share/pkgconfig"
     local GTK_FLAGS; GTK_FLAGS="$(env $PKG_ENV pkg-config --cflags --libs gtk+-3.0)"
-    $CC --sysroot="$SYSROOT" -O2 -Wall -Wextra -o "$B/neuralxp" "$PROJECT_DIR/linux/neuralxp-gtk.c" $GTK_FLAGS
+    $CC --sysroot="$SYSROOT" -O2 -Wall -Wextra $PREFIX_MAP -o "$B/neuralxp" "$PROJECT_DIR/linux/neuralxp-gtk.c" $GTK_FLAGS
 
     # ---------- stage /opt/neuralxp ----------
     local STAGE="$B/stage"
@@ -155,6 +167,9 @@ set(CMAKE_STRIP $TC/$TRIPLET-strip CACHE FILEPATH \"\")" >> "$B/toolchain.cmake"
             echo "ERROR: $(basename "$f") links libstdc++ dynamically"; bad=1
         fi
     done
+    # Fail if a binary still contains a path from the build machine (home directory, user name, work dirs)
+    local leaks; leaks="$(grep -laE "$HOME|$(id -un)|$LLAMA_DIR|$PROJECT_DIR|$WORK" "$STAGE"/bin/* 2>/dev/null || true)"
+    if [ -n "$leaks" ]; then echo "ERROR: build-machine paths found in: $leaks"; bad=1; fi
     [ $bad = 0 ] || exit 1
     mkdir -p "$STAGE/licenses"
     cp "$PROJECT_DIR/LICENSE" "$STAGE/licenses/NeuralXP-GPL-3.0.txt"

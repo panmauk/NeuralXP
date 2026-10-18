@@ -3,7 +3,7 @@
 ; XP-compatible NSIS installer
 
 !define APP_NAME "NeuralXP"
-!define APP_VERSION "1.0.2"
+!define APP_VERSION "1.0.3"
 !define APP_PUBLISHER "Panmox"
 !define APP_URL "https://panmox.org"
 !define APP_EXE "NeuralXP.exe"

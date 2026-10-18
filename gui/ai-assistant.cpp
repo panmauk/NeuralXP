@@ -973,7 +973,7 @@ static void DoSaveChat(void) {
 // About dialog
 static void DoAbout(void) {
     MessageBoxA(g_hWnd,
-        "NeuralXP v1.0\r\n"
+        "NeuralXP v1.0.3\r\n"
         "Offline AI Assistant for Windows XP\r\n"
         "\r\n"
         "Built by Panmox\r\n"
@@ -1322,8 +1322,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         }
         // Stop a running inference helper; it used to keep running (and eating CPU) after exit
+        // (No WaitForSingleObject on the worker here: it may be inside SendMessage to this very
+        //  thread, so waiting froze the window. Killing the helper ends its read loop, and the
+        //  process exits right after the window is destroyed.)
         if (g_hChildProcess) TerminateProcess(g_hChildProcess, 1);
-        if (g_hThread) WaitForSingleObject(g_hThread, 2000);
         // Auto-save on exit
         AutoSaveChat();
         DestroyWindow(hWnd);

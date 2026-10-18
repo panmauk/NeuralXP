@@ -17,12 +17,13 @@ fi
 # --- 1. Downgrade cpp-httplib to v0.15.3 (newer versions block pre-Win8.1) ---
 echo "[1/4] Downgrading cpp-httplib to v0.15.3..."
 if [ -f "vendor/cpp-httplib/httplib.h" ]; then
-    cp vendor/cpp-httplib/httplib.h vendor/cpp-httplib/httplib.h.backup
+    # keep the first backup: on re-runs httplib.h is already the downgraded copy
+    [ -f vendor/cpp-httplib/httplib.h.backup ] || cp vendor/cpp-httplib/httplib.h vendor/cpp-httplib/httplib.h.backup
     curl -sL https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h \
         -o vendor/cpp-httplib/httplib.h
     echo "  Done. Original backed up to httplib.h.backup"
 elif [ -f "examples/server/httplib.h" ]; then
-    cp examples/server/httplib.h examples/server/httplib.h.backup
+    [ -f examples/server/httplib.h.backup ] || cp examples/server/httplib.h examples/server/httplib.h.backup
     curl -sL https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.15.3/httplib.h \
         -o examples/server/httplib.h
     echo "  Done. Original backed up to httplib.h.backup"
@@ -71,6 +72,28 @@ if [ -f "$CPU_C" ] && grep -q "typedef CONDITION_VARIABLE ggml_cond_t;" "$CPU_C"
     echo "  Patching $CPU_C (threadpool sync -> XP-safe CRITICAL_SECTION + condition variable)..."
     cp "$(dirname "$0")/../patches/ggml-xp-threading.h" ggml/src/ggml-cpu/
     perl -0pi -e 's{typedef CONDITION_VARIABLE ggml_cond_t;.*?#define ggml_cond_broadcast\(c\) WakeAllConditionVariable\(c\)}{#include "ggml-xp-threading.h"}s' "$CPU_C"
+    PATCHED=$((PATCHED + 1))
+fi
+
+# 3a2. ggml.c timer init uses InitOnceExecuteOnce / PINIT_ONCE (Vista+). Replace it with a
+#      one-time init built on InterlockedCompareExchange (available on every NT version).
+GGML_C="ggml/src/ggml.c"
+if [ -f "$GGML_C" ] && grep -q "InitOnceExecuteOnce" "$GGML_C"; then
+    echo "  Patching $GGML_C (InitOnceExecuteOnce -> XP-safe one-time init)..."
+    perl -0pi -e '
+        s{static BOOL CALLBACK ggml_time_init_once\(PINIT_ONCE once, PVOID param, PVOID \*ctx\) \{\s*UNUSED\(once\);\s*UNUSED\(param\);\s*UNUSED\(ctx\);}{static void ggml_time_init_once(void) \{}s;
+        s{(QueryPerformanceCounter\(&t\);\s*timer_start = t\.QuadPart;\s*)return TRUE;\s*\}\s*void ggml_time_init\(void\) \{\s*static INIT_ONCE once = INIT_ONCE_STATIC_INIT;\s*InitOnceExecuteOnce\(&once, ggml_time_init_once, NULL, NULL\);\s*\}}{$1\}\nvoid ggml_time_init(void) \{\n    // XP: no InitOnce API. 0 = not started, 1 = running, 2 = done\n    static volatile LONG once_state = 0;\n    if (InterlockedCompareExchange(&once_state, 1, 0) == 0) \{\n        ggml_time_init_once();\n        InterlockedExchange(&once_state, 2);\n    \} else \{\n        while (once_state != 2) Sleep(0);\n    \}\n\}}s;
+    ' "$GGML_C"
+    grep -q "InitOnceExecuteOnce" "$GGML_C" && { echo "  ERROR: could not patch InitOnceExecuteOnce in $GGML_C"; exit 1; }
+    PATCHED=$((PATCHED + 1))
+fi
+
+# 3a3. 32-bit only: llama-model-loader stores 4 GiB in a size_t, which wraps to 0 on i686, so the
+#      "lazy read" path was enabled for every tensor instead of only for > 4 GiB ones. Use 64-bit.
+LOADER="src/llama-model-loader.cpp"
+if [ -f "$LOADER" ] && grep -q "constexpr size_t auto_min_size = 4ull" "$LOADER"; then
+    echo "  Patching $LOADER (32-bit size_t overflow in auto_min_size)..."
+    sed -i 's/constexpr size_t auto_min_size = 4ull/constexpr uint64_t auto_min_size = 4ull/' "$LOADER"
     PATCHED=$((PATCHED + 1))
 fi
 
